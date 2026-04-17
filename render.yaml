@@ -4,10 +4,13 @@ services:
     name: dancebuddy-api
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    # Added -u for unbuffered English logs and $PORT for Render compatibility
+    startCommand: python -u -m uvicorn server:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
+      - key: PYTHONUNBUFFERED
+        value: "1"
       - key: MONGO_URL
         sync: false
       - key: DB_NAME
@@ -16,7 +19,3 @@ services:
         generateValue: true
       - key: CORS_ORIGINS
         value: "*"
-      - key: SENDGRID_API_KEY
-        sync: false
-      - key: SENDGRID_FROM_EMAIL
-        value: noreply@dancebuddy.app
