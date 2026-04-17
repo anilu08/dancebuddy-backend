@@ -1,46 +1,73 @@
 import os
+import sys
+import time
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
 
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.security import HTTPBearer
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, EmailStr
-from jose import JWTError, jwt
+from jose import jwt
 from passlib.context import CryptContext
-from bson import ObjectId
 from dotenv import load_dotenv
+
+# --- RENDER LOG GÜNCELLEMESI ---
+# Logların anında ekrana düşmesini sağlar
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 
 # --- CONFIGURATION ---
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB Connection (Render Environment Variables are prioritized)
+# MongoDB Bağlantısı (Render panelindeki DB_NAME önceliklidir)
 MONGO_URL = os.environ.get('MONGO_URL')
-DB_NAME = os.environ.get('DB_NAME', 'dancebuddy')
+DB_NAME = os.environ.get('DB_NAME', 'dancebuddy_final_production') # Varsayılanı yeni db yaptık
 
 if not MONGO_URL:
-    # Fallback only for local development
     MONGO_URL = "mongodb://localhost:27017"
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
 
-# SECURITY - Using Argon2 to fix the "72 bytes" bcrypt limit issue
+# SECURITY
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 SECRET_KEY = os.environ.get("SECRET_KEY", "dancebuddy-super-secret-key-2026")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7 # 1 week
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7 
 
 security = HTTPBearer()
-app = FastAPI(title="DanceBuddy API", version="2.1")
+app = FastAPI(title="DanceBuddy API", version="2.2")
 api_router = APIRouter(prefix="/api")
 
-logging.basicConfig(level=logging.INFO)
+# --- LOGGING SETUP ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 logger = logging.getLogger(__name__)
+
+# Gelen her isteği zorla loglayan Middleware
+class LoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        start_time = time.time()
+        # Gelen isteği anında yazdır
+        print(f"📥 ISTEK GELDI: {request.method} {request.url.path}", flush=True)
+        
+        response = await call_next(request)
+        
+        duration = time.time() - start_time
+        # Sonucu anında yazdır
+        print(f"📤 CEVAP GITTI: {request.method} {request.url.path} - Durum: {response.status_code} ({duration:.2f}s)", flush=True)
+        return response
+
+app.add_middleware(LoggingMiddleware)
 
 # --- MODELS ---
 class UserRegister(BaseModel):
@@ -72,7 +99,8 @@ def get_password_hash(password):
 def verify_password(plain_password, hashed_password):
     try:
         return pwd_context.verify(plain_password, hashed_password)
-    except Exception:
+    except Exception as e:
+        print(f"❌ Şifre doğrulama hatası: {e}", flush=True)
         return False
 
 def create_access_token(data: dict):
@@ -93,7 +121,7 @@ def format_user_response(user: dict) -> dict:
 # --- AUTH ROUTES ---
 @api_router.post("/auth/register", response_model=Token)
 async def register(user_data: UserRegister):
-    # Check if user exists
+    print(f"📝 Kayıt denemesi: {user_data.email}", flush=True)
     if await db.users.find_one({"email": user_data.email.lower()}):
         raise HTTPException(status_code=400, detail="Email already registered")
     
@@ -107,6 +135,7 @@ async def register(user_data: UserRegister):
     
     result = await db.users.insert_one(user_dict)
     user_dict["_id"] = result.inserted_id
+    print(f"✅ Yeni kullanıcı kaydedildi: {user_data.email}", flush=True)
     
     access_token = create_access_token({"sub": str(result.inserted_id)})
     return {
@@ -117,11 +146,18 @@ async def register(user_data: UserRegister):
 
 @api_router.post("/auth/login", response_model=Token)
 async def login(credentials: UserLogin):
+    print(f"🔑 Giriş denemesi: {credentials.email}", flush=True)
     user = await db.users.find_one({"email": credentials.email.lower()})
     
-    if not user or not verify_password(credentials.password, user["password_hash"]):
+    if not user:
+        print(f"❌ Kullanıcı bulunamadı: {credentials.email}", flush=True)
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    if not verify_password(credentials.password, user["password_hash"]):
+        print(f"❌ Yanlış şifre: {credentials.email}", flush=True)
         raise HTTPException(status_code=401, detail="Invalid email or password")
     
+    print(f"🔓 Giriş başarılı: {credentials.email}", flush=True)
     access_token = create_access_token({"sub": str(user["_id"])})
     return {
         "access_token": access_token,
@@ -132,7 +168,12 @@ async def login(credentials: UserLogin):
 # --- PUBLIC ROUTES ---
 @api_router.get("/health")
 async def health():
-    return {"status": "ok", "version": "2.1", "db": "connected" if MONGO_URL else "local"}
+    return {
+        "status": "ok", 
+        "version": "2.2", 
+        "db": DB_NAME, 
+        "connected": True if MONGO_URL else False
+    }
 
 @api_router.get("/public/cities")
 async def get_cities():
@@ -150,7 +191,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+print(f"🚀 DanceBuddy API çalışıyor! Veritabanı: {DB_NAME}", flush=True)
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port
