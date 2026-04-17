@@ -16,8 +16,8 @@ from jose import jwt
 from passlib.context import CryptContext
 from dotenv import load_dotenv
 
-# --- RENDER LOG GÜNCELLEMESİ (ANLIK LOG AKIŞI) ---
-# Python'un çıktıları bekletmesini engeller, loglar anında ekrana düşer.
+# --- RENDER LOG OPTIMIZATION ---
+# Disables buffering so logs appear instantly in English
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
@@ -25,7 +25,6 @@ sys.stderr.reconfigure(line_buffering=True)
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB Bağlantısı - Tam olarak resimdeki isim: dancebuddy
 MONGO_URL = os.environ.get('MONGO_URL')
 DB_NAME = os.environ.get('DB_NAME', 'dancebuddy')
 
@@ -42,7 +41,7 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7 
 
 security = HTTPBearer()
-app = FastAPI(title="DanceBuddy API", version="2.2")
+app = FastAPI(title="DanceBuddy API", version="2.3")
 api_router = APIRouter(prefix="/api")
 
 # --- LOGGING SETUP ---
@@ -53,18 +52,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Gelen her isteği Render ekranına zorla yazdıran sistem
+# Middleware to track every request in the logs
 class LoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         start_time = time.time()
-        # Gelen isteği anında gösterir
-        print(f"📥 ISTEK: {request.method} {request.url.path}", flush=True)
+        print(f"📥 REQUEST: {request.method} {request.url.path}", flush=True)
         
         response = await call_next(request)
         
         duration = time.time() - start_time
-        # Sonucu anında gösterir
-        print(f"📤 CEVAP: {request.method} {request.url.path} - {response.status_code} ({duration:.2f}s)", flush=True)
+        print(f"📤 RESPONSE: {request.method} {request.url.path} - Status: {response.status_code} ({duration:.2f}s)", flush=True)
         return response
 
 app.add_middleware(LoggingMiddleware)
@@ -100,7 +97,7 @@ def verify_password(plain_password, hashed_password):
     try:
         return pwd_context.verify(plain_password, hashed_password)
     except Exception as e:
-        print(f"❌ Şifre doğrulama hatası: {e}", flush=True)
+        print(f"❌ Password verification error: {e}", flush=True)
         return False
 
 def create_access_token(data: dict):
@@ -121,9 +118,9 @@ def format_user_response(user: dict) -> dict:
 # --- AUTH ROUTES ---
 @api_router.post("/auth/register", response_model=Token)
 async def register(user_data: UserRegister):
-    print(f"📝 Kayıt denemesi: {user_data.email}", flush=True)
+    print(f"📝 Registration attempt: {user_data.email}", flush=True)
     if await db.users.find_one({"email": user_data.email.lower()}):
-        print(f"⚠️ Kayıt başarısız: Email zaten var -> {user_data.email}", flush=True)
+        print(f"⚠️ Registration failed: Email exists -> {user_data.email}", flush=True)
         raise HTTPException(status_code=400, detail="Email already registered")
     
     user_dict = {
@@ -136,7 +133,7 @@ async def register(user_data: UserRegister):
     
     result = await db.users.insert_one(user_dict)
     user_dict["_id"] = result.inserted_id
-    print(f"✅ Başarılı Kayıt: {user_data.email} veritabanına eklendi.", flush=True)
+    print(f"✅ User registered successfully: {user_data.email}", flush=True)
     
     access_token = create_access_token({"sub": str(result.inserted_id)})
     return {
@@ -147,18 +144,18 @@ async def register(user_data: UserRegister):
 
 @api_router.post("/auth/login", response_model=Token)
 async def login(credentials: UserLogin):
-    print(f"🔑 Giriş denemesi: {credentials.email}", flush=True)
+    print(f"🔑 Login attempt: {credentials.email}", flush=True)
     user = await db.users.find_one({"email": credentials.email.lower()})
     
     if not user:
-        print(f"❌ Hata: Kullanıcı bulunamadı -> {credentials.email}", flush=True)
+        print(f"❌ Error: User not found -> {credentials.email}", flush=True)
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     if not verify_password(credentials.password, user["password_hash"]):
-        print(f"❌ Hata: Şifre yanlış -> {credentials.email}", flush=True)
+        print(f"❌ Error: Incorrect password -> {credentials.email}", flush=True)
         raise HTTPException(status_code=401, detail="Invalid email or password")
     
-    print(f"🔓 Giriş Başarılı: {credentials.email}", flush=True)
+    print(f"🔓 Login Successful: {credentials.email}", flush=True)
     access_token = create_access_token({"sub": str(user["_id"])})
     return {
         "access_token": access_token,
@@ -166,15 +163,9 @@ async def login(credentials: UserLogin):
         "user": format_user_response(user)
     }
 
-# --- PUBLIC ROUTES ---
 @api_router.get("/health")
 async def health():
-    return {
-        "status": "ok", 
-        "version": "2.2", 
-        "db": DB_NAME, 
-        "connected": True if MONGO_URL else False
-    }
+    return {"status": "ok", "db": DB_NAME, "connected": True}
 
 # --- APP SETUP ---
 app.include_router(api_router)
@@ -187,9 +178,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-print(f"🚀 DanceBuddy API Aktif! Bağlanılan DB: {DB_NAME}", flush=True)
+print(f"🚀 DanceBuddy API Active! Target DB: {DB_NAME}", flush=True)
 
 if __name__ == "__main__":
     import uvicorn
+    # Auto-detect Render PORT or fallback to 8000
     port = int(os.environ.get("PORT", 8000))
+    print(f"📡 Starting server on port: {port}", flush=True)
     uvicorn.run(app, host="0.0.0.0", port=port)
