@@ -1,52 +1,39 @@
-import os
-import sys
-import time
-import logging
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import List, Optional
-
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.base import BaseHTTPMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, EmailStr
-from jose import JWTError, jwt
-from passlib.context import CryptContext
 from dotenv import load_dotenv
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+import os
+import logging
+from pathlib import Path
+from pydantic import BaseModel, Field, EmailStr
+from typing import List, Optional, Literal
+from datetime import datetime, timedelta
+from passlib.context import CryptContext
+from jose import JWTError, jwt
 from bson import ObjectId
+from enum import Enum
+import secrets
 
-# --- RENDER LOG OPTIMIZATION ---
-sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
-
-# --- CONFIGURATION ---
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-MONGO_URL = os.environ.get('MONGO_URL')
-DB_NAME = os.environ.get('DB_NAME', 'dancebuddy')
-
-if not MONGO_URL:
-    print("❌ CRITICAL ERROR: MONGO_URL environment variable is missing!", flush=True)
-    MONGO_URL = "mongodb://localhost:27017"
-else:
-    print(f"✅ Database Connection Initialized: {DB_NAME}", flush=True)
-
-client = AsyncIOMotorClient(MONGO_URL)
-db = client[DB_NAME]
+mongo_url = os.environ.get('MONGO_URL', 'mongodb://localhost:27017')
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ.get('DB_NAME', 'dancebuddy')]
 
 pwd_context = CryptContext(schemes=["argon2", "bcrypt"], deprecated="auto")
-SECRET_KEY = os.environ.get("SECRET_KEY", "dancebuddy-super-secret-key-2026")
+SECRET_KEY = os.environ.get("SECRET_KEY", "dancebuddy-secret-key-2025")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
 
 security = HTTPBearer()
-app = FastAPI(title="DanceBuddy API", version="3.0")
+app = FastAPI(title="DanceBuddy API", version="3.1")
 api_router = APIRouter(prefix="/api")
 
-# ===== FIXED 30 CITIES LIST =====
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 FIXED_CITIES = [
     "Lyon", "Budapest", "Phoenix", "Berlin", "London", "Warsaw", "Tel Aviv", "Cali",
     "Madrid", "New York", "Milan", "Paris", "Santo Domingo", "Istanbul", "Izmir",
@@ -59,26 +46,16 @@ DANCE_LEVELS = ["Beginner", "Intermediate", "Advanced"]
 EVENT_TYPES = ["Workshop", "Dance Night", "Social Meetup"]
 MEMORY_TYPES = ["Funniest Dance Moment", "Most Unforgettable Dance Moment"]
 
-# --- LOGGING MIDDLEWARE ---
-class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        start_time = time.time()
-        print(f"📥 {request.method} {request.url.path}", flush=True)
-        response = await call_next(request)
-        duration = time.time() - start_time
-        print(f"📤 {request.method} {request.url.path} - {response.status_code} ({duration:.2f}s)", flush=True)
-        return response
-
-app.add_middleware(LoggingMiddleware)
-
-# --- MODELS ---
 class UserRegister(BaseModel):
     name: str
     email: EmailStr
     password: str
     city: str
     bio: Optional[str] = ""
-    dance_level: Optional[str] = "Beginner"
+    photo: Optional[str] = None
+    gallery: Optional[List[str]] = []
+    dance_level: str = "Beginner"
+    favorite_dance_music: Optional[str] = ""
     dance_styles: Optional[List[str]] = []
 
 class UserLogin(BaseModel):
@@ -94,6 +71,24 @@ class UserUpdate(BaseModel):
     dance_level: Optional[str] = None
     favorite_dance_music: Optional[str] = None
     dance_styles: Optional[List[str]] = None
+
+class UserResponse(BaseModel):
+    id: str
+    name: str
+    email: str
+    city: str
+    bio: str = ""
+    photo: Optional[str] = None
+    gallery: List[str] = []
+    dance_level: str = "Beginner"
+    favorite_dance_music: str = ""
+    dance_styles: List[str] = []
+    created_at: datetime
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    user: UserResponse
 
 class EventCreate(BaseModel):
     title: str
@@ -119,16 +114,22 @@ class MemoryCreate(BaseModel):
     content: str
     city: Optional[str] = None
 
-# --- HELPERS ---
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
+
+def verify_password(plain, hashed):
+    try:
+        return pwd_context.verify(plain, hashed)
+    except Exception as e:
+        logger.error(f"Password verification error: {e}")
+        return False
+
 def get_password_hash(password):
     return pwd_context.hash(password)
-
-def verify_password(plain_password, hashed_password):
-    try:
-        return pwd_context.verify(plain_password, hashed_password)
-    except Exception as e:
-        print(f"❌ Verification Error: {e}", flush=True)
-        return False
 
 def create_access_token(data: dict):
     to_encode = data.copy()
@@ -140,15 +141,27 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     try:
         token = credentials.credentials
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = payload.get("sub")
+        user_id: str = payload.get("sub")
         user = await db.users.find_one({"_id": ObjectId(user_id)})
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
         return user
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
-    except Exception:
+    except Exception as e:
         raise HTTPException(status_code=401, detail="Authentication failed")
+
+async def get_optional_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False))):
+    if not credentials:
+        return None
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        user = await db.users.find_one({"_id": ObjectId(user_id)})
+        return user
+    except:
+        return None
 
 def format_user_response(user: dict) -> dict:
     return {
@@ -185,100 +198,148 @@ def format_event_response(event: dict, include_attendees: bool = False, include_
         result["comments"] = event.get("comments", []) or []
     return result
 
-# ===== AUTH ROUTES =====
-@api_router.post("/auth/register")
+def format_partner_request(request: dict) -> dict:
+    return {
+        "id": str(request["_id"]),
+        "title": request.get("title", ""),
+        "description": request.get("description", ""),
+        "city": request.get("city", ""),
+        "dance_style": request.get("dance_style", ""),
+        "looking_for_level": request.get("looking_for_level"),
+        "user_id": request.get("user_id"),
+        "user_name": request.get("user_name", ""),
+        "user_photo": request.get("user_photo"),
+        "created_at": request.get("created_at"),
+        "interested_users": request.get("interested_users", []) or [],
+        "interested_count": len(request.get("interested_users", []) or []),
+    }
+
+def format_memory(memory: dict) -> dict:
+    return {
+        "id": str(memory["_id"]),
+        "memory_type": memory.get("memory_type", ""),
+        "content": memory.get("content", ""),
+        "city": memory.get("city"),
+        "user_id": memory.get("user_id"),
+        "user_name": memory.get("user_name", ""),
+        "user_photo": memory.get("user_photo"),
+        "likes": memory.get("likes", []) or [],
+        "likes_count": len(memory.get("likes", []) or []),
+        "created_at": memory.get("created_at"),
+    }
+
+@api_router.post("/auth/register", response_model=Token)
 async def register(user_data: UserRegister):
-    print(f"📝 Registering: {user_data.email}", flush=True)
-    if await db.users.find_one({"email": user_data.email.lower()}):
+    if user_data.city not in FIXED_CITIES:
+        raise HTTPException(status_code=400, detail=f"Invalid city")
+    if await db.users.find_one({"email": user_data.email}):
         raise HTTPException(status_code=400, detail="Email already registered")
-    
     user_dict = {
         "name": user_data.name,
-        "email": user_data.email.lower(),
+        "email": user_data.email,
         "password_hash": get_password_hash(user_data.password),
         "city": user_data.city,
         "bio": user_data.bio or "",
-        "photo": None,
-        "gallery": [],
-        "dance_level": user_data.dance_level or "Beginner",
-        "favorite_dance_music": "",
+        "photo": user_data.photo,
+        "gallery": (user_data.gallery or [])[:5],
+        "dance_level": user_data.dance_level if user_data.dance_level in DANCE_LEVELS else "Beginner",
+        "favorite_dance_music": user_data.favorite_dance_music or "",
         "dance_styles": user_data.dance_styles or [],
         "created_at": datetime.utcnow()
     }
-    
     result = await db.users.insert_one(user_dict)
     user_dict["_id"] = result.inserted_id
-    print(f"✅ User created: {user_data.email}", flush=True)
-    
     return {
         "access_token": create_access_token({"sub": str(result.inserted_id)}),
         "token_type": "bearer",
         "user": format_user_response(user_dict)
     }
 
-@api_router.post("/auth/login")
+@api_router.post("/auth/login", response_model=Token)
 async def login(credentials: UserLogin):
-    print(f"🔑 Login: {credentials.email}", flush=True)
-    user = await db.users.find_one({"email": credentials.email.lower()})
-    
-    if not user or not verify_password(credentials.password, user["password_hash"]):
-        print(f"❌ Invalid credentials: {credentials.email}", flush=True)
+    user = await db.users.find_one({"email": credentials.email})
+    if not user:
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    
-    print(f"✅ Login success: {credentials.email}", flush=True)
+    if not verify_password(credentials.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
     return {
         "access_token": create_access_token({"sub": str(user["_id"])}),
         "token_type": "bearer",
         "user": format_user_response(user)
     }
 
-# ===== USER ROUTES =====
+@api_router.post("/auth/forgot-password")
+async def forgot_password(request: ForgotPasswordRequest):
+    user = await db.users.find_one({"email": request.email})
+    if not user:
+        return {"message": "If an account exists, reset instructions will be sent."}
+    reset_token = secrets.token_urlsafe(32)
+    expires = datetime.utcnow() + timedelta(hours=1)
+    await db.password_resets.delete_many({"email": request.email})
+    await db.password_resets.insert_one({
+        "email": request.email,
+        "token": reset_token,
+        "expires": expires,
+        "created_at": datetime.utcnow()
+    })
+    logger.info(f"Password reset token for {request.email}: {reset_token}")
+    return {"message": "If an account exists, reset instructions will be sent."}
+
+@api_router.post("/auth/reset-password")
+async def reset_password(request: ResetPasswordRequest):
+    reset_record = await db.password_resets.find_one({"token": request.token})
+    if not reset_record:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+    if reset_record["expires"] < datetime.utcnow():
+        await db.password_resets.delete_one({"token": request.token})
+        raise HTTPException(status_code=400, detail="Reset token has expired")
+    new_hash = get_password_hash(request.new_password)
+    await db.users.update_one({"email": reset_record["email"]}, {"$set": {"password_hash": new_hash}})
+    await db.password_resets.delete_one({"token": request.token})
+    return {"message": "Password has been reset successfully"}
+
 @api_router.get("/users/me")
-async def get_my_profile(current_user=Depends(get_current_user)):
+async def get_my_profile(current_user = Depends(get_current_user)):
     return format_user_response(current_user)
 
 @api_router.put("/users/me")
-async def update_profile(user_data: UserUpdate, current_user=Depends(get_current_user)):
-    update_dict = {}
-    if user_data.name is not None: update_dict["name"] = user_data.name
-    if user_data.bio is not None: update_dict["bio"] = user_data.bio
-    if user_data.photo is not None: update_dict["photo"] = user_data.photo
-    if user_data.gallery is not None: update_dict["gallery"] = user_data.gallery[:5]
-    if user_data.city is not None: update_dict["city"] = user_data.city
-    if user_data.dance_level is not None: update_dict["dance_level"] = user_data.dance_level
-    if user_data.favorite_dance_music is not None: update_dict["favorite_dance_music"] = user_data.favorite_dance_music
-    if user_data.dance_styles is not None: update_dict["dance_styles"] = user_data.dance_styles
-    
-    if update_dict:
-        await db.users.update_one({"_id": current_user["_id"]}, {"$set": update_dict})
-    
-    updated = await db.users.find_one({"_id": current_user["_id"]})
-    return format_user_response(updated)
+async def update_my_profile(updates: UserUpdate, current_user = Depends(get_current_user)):
+    update_data = {}
+    if updates.name: update_data["name"] = updates.name
+    if updates.bio is not None: update_data["bio"] = updates.bio
+    if updates.photo is not None: update_data["photo"] = updates.photo
+    if updates.gallery is not None: update_data["gallery"] = updates.gallery[:5]
+    if updates.city and updates.city in FIXED_CITIES: update_data["city"] = updates.city
+    if updates.dance_level and updates.dance_level in DANCE_LEVELS: update_data["dance_level"] = updates.dance_level
+    if updates.favorite_dance_music is not None: update_data["favorite_dance_music"] = updates.favorite_dance_music
+    if updates.dance_styles is not None: update_data["dance_styles"] = updates.dance_styles
+    if update_data:
+        await db.users.update_one({"_id": current_user["_id"]}, {"$set": update_data})
+    updated_user = await db.users.find_one({"_id": current_user["_id"]})
+    return format_user_response(updated_user)
 
 @api_router.get("/users")
-async def get_all_users(city: Optional[str] = None, current_user=Depends(get_current_user)):
-    query = {"_id": {"$ne": current_user["_id"]}}
+async def get_users(city: Optional[str] = None, current_user = Depends(get_current_user)):
+    query = {}
     if city and city in FIXED_CITIES:
         query["city"] = city
-    users = await db.users.find(query).limit(100).to_list(100)
+    users = await db.users.find(query).sort("created_at", -1).limit(100).to_list(100)
     return [format_user_response(u) for u in users]
 
 @api_router.get("/users/{user_id}")
-async def get_user_detail(user_id: str, current_user=Depends(get_current_user)):
+async def get_user(user_id: str, current_user = Depends(get_current_user)):
     try:
         user = await db.users.find_one({"_id": ObjectId(user_id)})
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         return format_user_response(user)
     except:
-        raise HTTPException(status_code=400, detail="Invalid user ID")
+        raise HTTPException(status_code=404, detail="User not found")
 
-# ===== PUBLIC ROUTES (Guest Access) =====
 @api_router.get("/public/events")
 async def get_public_events(city: Optional[str] = None):
-    print(f"👀 Guest viewing events", flush=True)
     now = datetime.utcnow()
-    query = {"end_time": {"$gt": now}}
+    query = {"end_time": {"$gte": now}}
     if city and city in FIXED_CITIES:
         query["city"] = city
     events = await db.events.find(query).sort("start_time", 1).limit(50).to_list(50)
@@ -292,83 +353,97 @@ async def get_cities():
 async def get_dance_styles():
     return {"dance_styles": DANCE_STYLES}
 
-# ===== EVENT ROUTES (Auth Required) =====
 @api_router.get("/events")
-async def get_events(city: Optional[str] = None, current_user=Depends(get_current_user)):
+async def get_events(city: Optional[str] = None, current_user = Depends(get_current_user)):
     now = datetime.utcnow()
-    query = {"end_time": {"$gt": now}}
+    query = {"end_time": {"$gte": now}}
     if city and city in FIXED_CITIES:
         query["city"] = city
     events = await db.events.find(query).sort("start_time", 1).limit(50).to_list(50)
-    return [format_event_response(e, include_attendees=True, include_comments=True) for e in events]
+    return [format_event_response(e, include_attendees=True) for e in events]
+
+@api_router.get("/events/{event_id}")
+async def get_event(event_id: str, current_user = Depends(get_current_user)):
+    try:
+        event = await db.events.find_one({"_id": ObjectId(event_id)})
+        if not event:
+            raise HTTPException(status_code=404, detail="Event not found")
+        return format_event_response(event, include_attendees=True, include_comments=True)
+    except:
+        raise HTTPException(status_code=404, detail="Event not found")
 
 @api_router.post("/events")
-async def create_event(event_data: EventCreate, current_user=Depends(get_current_user)):
+async def create_event(event_data: EventCreate, current_user = Depends(get_current_user)):
     if event_data.city not in FIXED_CITIES:
         raise HTTPException(status_code=400, detail="Invalid city")
     if event_data.end_time <= event_data.start_time:
         raise HTTPException(status_code=400, detail="End time must be after start time")
-    
-    event = {
+    event_dict = {
         "title": event_data.title,
-        "event_type": event_data.event_type,
+        "event_type": event_data.event_type if event_data.event_type in EVENT_TYPES else "Dance Night",
         "city": event_data.city,
         "description": event_data.description or "",
         "start_time": event_data.start_time,
         "end_time": event_data.end_time,
         "dance_styles": event_data.dance_styles or [],
         "created_by": str(current_user["_id"]),
-        "created_at": datetime.utcnow(),
-        "attendees": [],
-        "comments": []
+        "attendees": [str(current_user["_id"])],
+        "comments": [],
+        "created_at": datetime.utcnow()
     }
-    result = await db.events.insert_one(event)
-    event["_id"] = result.inserted_id
-    print(f"✅ Event created: {event_data.title}", flush=True)
-    return format_event_response(event, include_attendees=True, include_comments=True)
+    result = await db.events.insert_one(event_dict)
+    event_dict["_id"] = result.inserted_id
+    return format_event_response(event_dict, include_attendees=True)
 
 @api_router.post("/events/{event_id}/join")
-async def join_event(event_id: str, current_user=Depends(get_current_user)):
+async def join_event(event_id: str, current_user = Depends(get_current_user)):
     try:
         event = await db.events.find_one({"_id": ObjectId(event_id)})
         if not event:
             raise HTTPException(status_code=404, detail="Event not found")
-        
         user_id = str(current_user["_id"])
         attendees = event.get("attendees", []) or []
-        
-        if any(a.get("user_id") == user_id for a in attendees):
+        if user_id in attendees:
             raise HTTPException(status_code=400, detail="Already joined")
-        
-        attendee_info = {
-            "user_id": user_id,
-            "name": current_user.get("name", ""),
-            "photo": current_user.get("photo"),
-            "joined_at": datetime.utcnow()
-        }
-        await db.events.update_one({"_id": ObjectId(event_id)}, {"$push": {"attendees": attendee_info}})
-        print(f"✅ User joined event: {event_id}", flush=True)
-        return {"success": True, "message": "Joined event"}
+        await db.events.update_one({"_id": ObjectId(event_id)}, {"$push": {"attendees": user_id}})
+        return {"message": "Joined event"}
     except HTTPException:
         raise
     except:
-        raise HTTPException(status_code=400, detail="Invalid event ID")
+        raise HTTPException(status_code=404, detail="Event not found")
 
 @api_router.delete("/events/{event_id}/join")
-async def leave_event(event_id: str, current_user=Depends(get_current_user)):
-    user_id = str(current_user["_id"])
-    await db.events.update_one({"_id": ObjectId(event_id)}, {"$pull": {"attendees": {"user_id": user_id}}})
-    return {"success": True, "message": "Left event"}
+async def leave_event(event_id: str, current_user = Depends(get_current_user)):
+    try:
+        user_id = str(current_user["_id"])
+        await db.events.update_one({"_id": ObjectId(event_id)}, {"$pull": {"attendees": user_id}})
+        return {"message": "Left event"}
+    except:
+        raise HTTPException(status_code=404, detail="Event not found")
 
-@api_router.post("/events/{event_id}/comments")
-async def add_comment(event_id: str, comment_data: EventComment, current_user=Depends(get_current_user)):
+@api_router.get("/events/{event_id}/attendees")
+async def get_event_attendees(event_id: str, current_user = Depends(get_current_user)):
     try:
         event = await db.events.find_one({"_id": ObjectId(event_id)})
         if not event:
             raise HTTPException(status_code=404, detail="Event not found")
-        
+        attendee_ids = event.get("attendees", []) or []
+        attendees = []
+        for aid in attendee_ids:
+            try:
+                user = await db.users.find_one({"_id": ObjectId(aid)})
+                if user:
+                    attendees.append(format_user_response(user))
+            except:
+                pass
+        return attendees
+    except:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+@api_router.post("/events/{event_id}/comments")
+async def add_comment(event_id: str, comment_data: EventComment, current_user = Depends(get_current_user)):
+    try:
         comment = {
-            "id": str(ObjectId()),
             "user_id": str(current_user["_id"]),
             "user_name": current_user.get("name", ""),
             "user_photo": current_user.get("photo"),
@@ -377,95 +452,132 @@ async def add_comment(event_id: str, comment_data: EventComment, current_user=De
         }
         await db.events.update_one({"_id": ObjectId(event_id)}, {"$push": {"comments": comment}})
         return comment
-    except HTTPException:
-        raise
     except:
-        raise HTTPException(status_code=400, detail="Invalid event ID")
+        raise HTTPException(status_code=404, detail="Event not found")
 
-# ===== PARTNER REQUESTS =====
+@api_router.get("/events/{event_id}/comments")
+async def get_comments(event_id: str, current_user = Depends(get_current_user)):
+    try:
+        event = await db.events.find_one({"_id": ObjectId(event_id)})
+        if not event:
+            raise HTTPException(status_code=404, detail="Event not found")
+        return event.get("comments", []) or []
+    except:
+        raise HTTPException(status_code=404, detail="Event not found")
+
 @api_router.get("/partner-requests")
-async def get_partner_requests(city: Optional[str] = None, dance_style: Optional[str] = None, current_user=Depends(get_current_user)):
+async def get_partner_requests(city: Optional[str] = None, dance_style: Optional[str] = None, current_user = Depends(get_current_user)):
     query = {}
     if city and city in FIXED_CITIES:
         query["city"] = city
-    if dance_style:
+    if dance_style and dance_style in DANCE_STYLES:
         query["dance_style"] = dance_style
     requests = await db.partner_requests.find(query).sort("created_at", -1).limit(50).to_list(50)
-    return [{
-        "id": str(r["_id"]),
-        "title": r.get("title", ""),
-        "description": r.get("description", ""),
-        "city": r.get("city", ""),
-        "dance_style": r.get("dance_style", ""),
-        "looking_for_level": r.get("looking_for_level"),
-        "user_id": r.get("user_id"),
-        "user_name": r.get("user_name", ""),
-        "user_photo": r.get("user_photo"),
-        "created_at": r.get("created_at")
-    } for r in requests]
+    return [format_partner_request(r) for r in requests]
 
 @api_router.post("/partner-requests")
-async def create_partner_request(request_data: PartnerRequestCreate, current_user=Depends(get_current_user)):
+async def create_partner_request(request_data: PartnerRequestCreate, current_user = Depends(get_current_user)):
     if request_data.city not in FIXED_CITIES:
         raise HTTPException(status_code=400, detail="Invalid city")
-    
-    partner_request = {
+    if request_data.dance_style not in DANCE_STYLES:
+        raise HTTPException(status_code=400, detail="Invalid dance style")
+    request_dict = {
         "title": request_data.title,
         "description": request_data.description or "",
         "city": request_data.city,
         "dance_style": request_data.dance_style,
-        "looking_for_level": request_data.looking_for_level,
+        "looking_for_level": request_data.looking_for_level if request_data.looking_for_level in DANCE_LEVELS else None,
         "user_id": str(current_user["_id"]),
         "user_name": current_user.get("name", ""),
         "user_photo": current_user.get("photo"),
+        "interested_users": [],
         "created_at": datetime.utcnow()
     }
-    result = await db.partner_requests.insert_one(partner_request)
-    partner_request["id"] = str(result.inserted_id)
-    print(f"✅ Partner request created: {request_data.title}", flush=True)
-    return partner_request
+    result = await db.partner_requests.insert_one(request_dict)
+    request_dict["_id"] = result.inserted_id
+    return format_partner_request(request_dict)
 
 @api_router.delete("/partner-requests/{request_id}")
-async def delete_partner_request(request_id: str, current_user=Depends(get_current_user)):
+async def delete_partner_request(request_id: str, current_user = Depends(get_current_user)):
     try:
         request = await db.partner_requests.find_one({"_id": ObjectId(request_id)})
         if not request:
             raise HTTPException(status_code=404, detail="Request not found")
-        if request.get("user_id") != str(current_user["_id"]):
+        if request["user_id"] != str(current_user["_id"]):
             raise HTTPException(status_code=403, detail="Not authorized")
         await db.partner_requests.delete_one({"_id": ObjectId(request_id)})
-        return {"success": True}
+        return {"message": "Request deleted"}
     except HTTPException:
         raise
     except:
-        raise HTTPException(status_code=400, detail="Invalid request ID")
+        raise HTTPException(status_code=404, detail="Request not found")
 
-# ===== DANCE MEMORIES =====
+@api_router.post("/partner-requests/{request_id}/interest")
+async def express_interest(request_id: str, current_user = Depends(get_current_user)):
+    try:
+        request = await db.partner_requests.find_one({"_id": ObjectId(request_id)})
+        if not request:
+            raise HTTPException(status_code=404, detail="Request not found")
+        user_id = str(current_user["_id"])
+        if request["user_id"] == user_id:
+            raise HTTPException(status_code=400, detail="Cannot express interest in your own request")
+        interested = request.get("interested_users", []) or []
+        if user_id in interested:
+            raise HTTPException(status_code=400, detail="Already expressed interest")
+        await db.partner_requests.update_one({"_id": ObjectId(request_id)}, {"$push": {"interested_users": user_id}})
+        return {"message": "Interest expressed"}
+    except HTTPException:
+        raise
+    except:
+        raise HTTPException(status_code=404, detail="Request not found")
+
+@api_router.delete("/partner-requests/{request_id}/interest")
+async def remove_interest(request_id: str, current_user = Depends(get_current_user)):
+    try:
+        user_id = str(current_user["_id"])
+        await db.partner_requests.update_one({"_id": ObjectId(request_id)}, {"$pull": {"interested_users": user_id}})
+        return {"message": "Interest removed"}
+    except:
+        raise HTTPException(status_code=404, detail="Request not found")
+
+@api_router.get("/partner-requests/{request_id}/interested")
+async def get_interested_users(request_id: str, current_user = Depends(get_current_user)):
+    try:
+        request = await db.partner_requests.find_one({"_id": ObjectId(request_id)})
+        if not request:
+            raise HTTPException(status_code=404, detail="Request not found")
+        if request["user_id"] != str(current_user["_id"]):
+            raise HTTPException(status_code=403, detail="Only owner can view")
+        interested_ids = request.get("interested_users", []) or []
+        users = []
+        for uid in interested_ids:
+            try:
+                user = await db.users.find_one({"_id": ObjectId(uid)})
+                if user:
+                    users.append(format_user_response(user))
+            except:
+                pass
+        return users
+    except HTTPException:
+        raise
+    except:
+        raise HTTPException(status_code=404, detail="Request not found")
+
 @api_router.get("/memories")
-async def get_memories(memory_type: Optional[str] = None, current_user=Depends(get_current_user)):
+async def get_memories(memory_type: Optional[str] = None, current_user = Depends(get_current_user)):
     query = {}
     if memory_type and memory_type in MEMORY_TYPES:
         query["memory_type"] = memory_type
     memories = await db.memories.find(query).sort("created_at", -1).limit(50).to_list(50)
-    return [{
-        "id": str(m["_id"]),
-        "memory_type": m.get("memory_type", ""),
-        "content": m.get("content", ""),
-        "city": m.get("city"),
-        "user_id": m.get("user_id"),
-        "user_name": m.get("user_name", ""),
-        "user_photo": m.get("user_photo"),
-        "likes": m.get("likes", []) or [],
-        "likes_count": len(m.get("likes", []) or []),
-        "created_at": m.get("created_at")
-    } for m in memories]
+    return [format_memory(m) for m in memories]
 
 @api_router.post("/memories")
-async def create_memory(memory_data: MemoryCreate, current_user=Depends(get_current_user)):
+async def create_memory(memory_data: MemoryCreate, current_user = Depends(get_current_user)):
     if memory_data.memory_type not in MEMORY_TYPES:
         raise HTTPException(status_code=400, detail="Invalid memory type")
-    
-    memory = {
+    if memory_data.city and memory_data.city not in FIXED_CITIES:
+        raise HTTPException(status_code=400, detail="Invalid city")
+    memory_dict = {
         "memory_type": memory_data.memory_type,
         "content": memory_data.content,
         "city": memory_data.city,
@@ -475,87 +587,84 @@ async def create_memory(memory_data: MemoryCreate, current_user=Depends(get_curr
         "likes": [],
         "created_at": datetime.utcnow()
     }
-    result = await db.memories.insert_one(memory)
-    memory["id"] = str(result.inserted_id)
-    memory["likes_count"] = 0
-    print(f"✅ Memory created", flush=True)
-    return memory
+    result = await db.memories.insert_one(memory_dict)
+    memory_dict["_id"] = result.inserted_id
+    return format_memory(memory_dict)
 
 @api_router.post("/memories/{memory_id}/like")
-async def like_memory(memory_id: str, current_user=Depends(get_current_user)):
+async def like_memory(memory_id: str, current_user = Depends(get_current_user)):
     try:
-        user_id = str(current_user["_id"])
         memory = await db.memories.find_one({"_id": ObjectId(memory_id)})
         if not memory:
             raise HTTPException(status_code=404, detail="Memory not found")
-        
+        user_id = str(current_user["_id"])
         likes = memory.get("likes", []) or []
         if user_id in likes:
             await db.memories.update_one({"_id": ObjectId(memory_id)}, {"$pull": {"likes": user_id}})
-            return {"liked": False, "likes_count": len(likes) - 1}
+            return {"message": "Unliked", "liked": False}
         else:
             await db.memories.update_one({"_id": ObjectId(memory_id)}, {"$push": {"likes": user_id}})
-            return {"liked": True, "likes_count": len(likes) + 1}
-    except HTTPException:
-        raise
+            return {"message": "Liked", "liked": True}
     except:
-        raise HTTPException(status_code=400, detail="Invalid memory ID")
+        raise HTTPException(status_code=404, detail="Memory not found")
 
 @api_router.delete("/memories/{memory_id}")
-async def delete_memory(memory_id: str, current_user=Depends(get_current_user)):
+async def delete_memory(memory_id: str, current_user = Depends(get_current_user)):
     try:
         memory = await db.memories.find_one({"_id": ObjectId(memory_id)})
         if not memory:
             raise HTTPException(status_code=404, detail="Memory not found")
-        if memory.get("user_id") != str(current_user["_id"]):
+        if memory["user_id"] != str(current_user["_id"]):
             raise HTTPException(status_code=403, detail="Not authorized")
         await db.memories.delete_one({"_id": ObjectId(memory_id)})
-        return {"success": True}
+        return {"message": "Memory deleted"}
     except HTTPException:
         raise
     except:
-        raise HTTPException(status_code=400, detail="Invalid memory ID")
+        raise HTTPException(status_code=404, detail="Memory not found")
 
-# ===== SEED DATA =====
 @api_router.post("/seed")
 async def seed_database():
-    user_count = await db.users.count_documents({})
-    if user_count > 5:
-        return {"message": "Already seeded", "users": user_count}
-    
-    dummy_users = [
-        {"name": "Maria Salsa", "email": "maria@example.com", "password_hash": get_password_hash("test123"), "city": "Istanbul", "bio": "Salsa dancer", "dance_level": "Advanced", "dance_styles": ["Salsa"], "created_at": datetime.utcnow()},
-        {"name": "Jean WCS", "email": "jean@example.com", "password_hash": get_password_hash("test123"), "city": "Lyon", "bio": "WCS enthusiast", "dance_level": "Intermediate", "dance_styles": ["West Coast Swing"], "created_at": datetime.utcnow()},
-        {"name": "Klaus Tango", "email": "klaus@example.com", "password_hash": get_password_hash("test123"), "city": "Berlin", "bio": "Tango dancer", "dance_level": "Advanced", "dance_styles": ["Tango"], "created_at": datetime.utcnow()},
-        {"name": "Sarah Bachata", "email": "sarah@example.com", "password_hash": get_password_hash("test123"), "city": "New York", "bio": "Bachata teacher", "dance_level": "Advanced", "dance_styles": ["Bachata"], "created_at": datetime.utcnow()},
-        {"name": "Peter Swing", "email": "peter@example.com", "password_hash": get_password_hash("test123"), "city": "Budapest", "bio": "Swing dancer", "dance_level": "Beginner", "dance_styles": ["Swing"], "created_at": datetime.utcnow()},
+    test_users = [
+        {"name": "Maria Garcia", "email": "maria@example.com", "city": "Berlin", "dance_level": "Advanced", "dance_styles": ["Salsa", "Bachata"]},
+        {"name": "John Smith", "email": "john@example.com", "city": "New York", "dance_level": "Intermediate", "dance_styles": ["Tango"]},
+        {"name": "Sophie Laurent", "email": "sophie@example.com", "city": "Paris", "dance_level": "Beginner", "dance_styles": ["Salsa"]},
     ]
-    
-    for user in dummy_users:
-        if not await db.users.find_one({"email": user["email"]}):
-            await db.users.insert_one(user)
-    
+    created_users = []
+    for user_data in test_users:
+        existing = await db.users.find_one({"email": user_data["email"]})
+        if not existing:
+            user_dict = {
+                **user_data,
+                "password_hash": get_password_hash("test123"),
+                "bio": f"Dancer from {user_data['city']}",
+                "photo": None,
+                "gallery": [],
+                "favorite_dance_music": "",
+                "created_at": datetime.utcnow()
+            }
+            result = await db.users.insert_one(user_dict)
+            created_users.append(str(result.inserted_id))
     now = datetime.utcnow()
-    events = [
-        {"title": "Salsa Night", "event_type": "Social Meetup", "city": "Istanbul", "description": "Weekly salsa", "start_time": now + timedelta(days=2), "end_time": now + timedelta(days=2, hours=4), "dance_styles": ["Salsa"], "created_by": "system", "created_at": now, "attendees": [], "comments": []},
-        {"title": "Bachata Workshop", "event_type": "Workshop", "city": "New York", "description": "Beginner workshop", "start_time": now + timedelta(days=5), "end_time": now + timedelta(days=5, hours=2), "dance_styles": ["Bachata"], "created_by": "system", "created_at": now, "attendees": [], "comments": []},
-        {"title": "Tango Milonga", "event_type": "Dance Night", "city": "Berlin", "description": "Traditional milonga", "start_time": now + timedelta(days=7), "end_time": now + timedelta(days=7, hours=5), "dance_styles": ["Tango"], "created_by": "system", "created_at": now, "attendees": [], "comments": []},
+    test_events = [
+        {"title": "Friday Salsa Night", "event_type": "Dance Night", "city": "Berlin", "dance_styles": ["Salsa"]},
+        {"title": "Tango Workshop", "event_type": "Workshop", "city": "New York", "dance_styles": ["Tango"]},
     ]
-    
-    for event in events:
-        if not await db.events.find_one({"title": event["title"]}):
-            await db.events.insert_one(event)
-    
-    print("✅ Database seeded", flush=True)
-    return {"message": "Seeded", "users_added": 5, "events_added": 3}
-
-# ===== HEALTH CHECK =====
-@api_router.get("/health")
-async def health():
-    return {"status": "ok", "db": DB_NAME, "version": "3.0"}
-
-# --- APP SETUP ---
-app.include_router(api_router)
+    for i, event_data in enumerate(test_events):
+        existing = await db.events.find_one({"title": event_data["title"]})
+        if not existing:
+            event_dict = {
+                **event_data,
+                "description": f"Join us for {event_data['event_type']}!",
+                "start_time": now + timedelta(days=i+1, hours=19),
+                "end_time": now + timedelta(days=i+1, hours=23),
+                "created_by": created_users[0] if created_users else "system",
+                "attendees": [],
+                "comments": [],
+                "created_at": datetime.utcnow()
+            }
+            await db.events.insert_one(event_dict)
+    return {"message": "Database seeded", "users_created": len(created_users)}
 
 app.add_middleware(
     CORSMiddleware,
@@ -565,9 +674,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-print(f"🚀 DanceBuddy API v3.0 | Database: {DB_NAME}", flush=True)
+app.include_router(api_router)
 
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+@app.get("/")
+async def root():
+    return {"message": "DanceBuddy API v3.1", "status": "running"}
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "version": "3.1"}
