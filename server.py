@@ -17,7 +17,7 @@ from passlib.context import CryptContext
 from dotenv import load_dotenv
 
 # --- RENDER LOG OPTIMIZATION ---
-# Disables buffering so logs appear instantly in English
+# Forces logs to flush instantly so you can see them on the Render dashboard
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
@@ -25,34 +25,32 @@ sys.stderr.reconfigure(line_buffering=True)
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
+# Connection logic: No more localhost fallback. If MONGO_URL is missing, it will warn you.
 MONGO_URL = os.environ.get('MONGO_URL')
 DB_NAME = os.environ.get('DB_NAME', 'dancebuddy')
 
 if not MONGO_URL:
+    print("❌ CRITICAL ERROR: MONGO_URL environment variable is missing!", flush=True)
+    # Falling back to localhost only for local dev safety, but this will fail on Render
     MONGO_URL = "mongodb://localhost:27017"
+else:
+    print(f"✅ Database Connection Initialized: {DB_NAME}", flush=True)
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
 
-# SECURITY
+# SECURITY - Locked to argon2 to prevent login issues with old bcrypt data
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 SECRET_KEY = os.environ.get("SECRET_KEY", "dancebuddy-super-secret-key-2026")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7 
 
 security = HTTPBearer()
-app = FastAPI(title="DanceBuddy API", version="2.3")
+app = FastAPI(title="DanceBuddy API", version="2.5")
 api_router = APIRouter(prefix="/api")
 
-# --- LOGGING SETUP ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger(__name__)
-
-# Middleware to track every request in the logs
+# --- LOGGING MIDDLEWARE ---
+# This is what makes every phone request visible in Render logs
 class LoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         start_time = time.time()
@@ -97,7 +95,7 @@ def verify_password(plain_password, hashed_password):
     try:
         return pwd_context.verify(plain_password, hashed_password)
     except Exception as e:
-        print(f"❌ Password verification error: {e}", flush=True)
+        print(f"❌ Verification Error: {e}", flush=True)
         return False
 
 def create_access_token(data: dict):
@@ -118,9 +116,8 @@ def format_user_response(user: dict) -> dict:
 # --- AUTH ROUTES ---
 @api_router.post("/auth/register", response_model=Token)
 async def register(user_data: UserRegister):
-    print(f"📝 Registration attempt: {user_data.email}", flush=True)
+    print(f"📝 Attempting to register: {user_data.email}", flush=True)
     if await db.users.find_one({"email": user_data.email.lower()}):
-        print(f"⚠️ Registration failed: Email exists -> {user_data.email}", flush=True)
         raise HTTPException(status_code=400, detail="Email already registered")
     
     user_dict = {
@@ -133,7 +130,7 @@ async def register(user_data: UserRegister):
     
     result = await db.users.insert_one(user_dict)
     user_dict["_id"] = result.inserted_id
-    print(f"✅ User registered successfully: {user_data.email}", flush=True)
+    print(f"✅ User created in database: {user_data.email}", flush=True)
     
     access_token = create_access_token({"sub": str(result.inserted_id)})
     return {
@@ -144,18 +141,14 @@ async def register(user_data: UserRegister):
 
 @api_router.post("/auth/login", response_model=Token)
 async def login(credentials: UserLogin):
-    print(f"🔑 Login attempt: {credentials.email}", flush=True)
+    print(f"🔑 Login attempt for: {credentials.email}", flush=True)
     user = await db.users.find_one({"email": credentials.email.lower()})
     
-    if not user:
-        print(f"❌ Error: User not found -> {credentials.email}", flush=True)
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-
-    if not verify_password(credentials.password, user["password_hash"]):
-        print(f"❌ Error: Incorrect password -> {credentials.email}", flush=True)
+    if not user or not verify_password(credentials.password, user["password_hash"]):
+        print(f"❌ Invalid credentials for: {credentials.email}", flush=True)
         raise HTTPException(status_code=401, detail="Invalid email or password")
     
-    print(f"🔓 Login Successful: {credentials.email}", flush=True)
+    print(f"🔓 Successful login: {credentials.email}", flush=True)
     access_token = create_access_token({"sub": str(user["_id"])})
     return {
         "access_token": access_token,
@@ -178,11 +171,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-print(f"🚀 DanceBuddy API Active! Target DB: {DB_NAME}", flush=True)
+print(f"🚀 API STARTUP SUCCESSFUL | Database: {DB_NAME}", flush=True)
 
 if __name__ == "__main__":
     import uvicorn
-    # Auto-detect Render PORT or fallback to 8000
     port = int(os.environ.get("PORT", 8000))
-    print(f"📡 Starting server on port: {port}", flush=True)
     uvicorn.run(app, host="0.0.0.0", port=port)
